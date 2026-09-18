@@ -112,29 +112,6 @@ export interface CompactionResult<T = unknown> {
 	details?: T;
 }
 
-function combineUsage(first: Usage, second: Usage): Usage {
-	return {
-		input: first.input + second.input,
-		output: first.output + second.output,
-		cacheRead: first.cacheRead + second.cacheRead,
-		cacheWrite: first.cacheWrite + second.cacheWrite,
-		...(first.cacheWrite1h !== undefined || second.cacheWrite1h !== undefined
-			? { cacheWrite1h: (first.cacheWrite1h ?? 0) + (second.cacheWrite1h ?? 0) }
-			: {}),
-		...(first.reasoning !== undefined || second.reasoning !== undefined
-			? { reasoning: (first.reasoning ?? 0) + (second.reasoning ?? 0) }
-			: {}),
-		totalTokens: first.totalTokens + second.totalTokens,
-		cost: {
-			input: first.cost.input + second.cost.input,
-			output: first.cost.output + second.cost.output,
-			cacheRead: first.cost.cacheRead + second.cost.cacheRead,
-			cacheWrite: first.cost.cacheWrite + second.cost.cacheWrite,
-			total: first.cost.total + second.cost.total,
-		},
-	};
-}
-
 // ============================================================================
 // Types
 // ============================================================================
@@ -528,6 +505,8 @@ export function findCutPoint(
 
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. Do NOT call any tools. Do NOT perform any further investigation. ONLY output the structured summary factually, based solely on the current conversation.
+
 Use this EXACT format:
 
 ## Goal
@@ -559,7 +538,7 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summary with new information. RULES:
+const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summary with new information. Do NOT perform any further investigation. ONLY output the structured summary factually, based solely on the current conversation. RULES:
 - PRESERVE all existing information from the previous summary
 - ADD new progress, decisions, and context from the new messages
 - UPDATE the Progress section: move items from "In Progress" to "Done" when completed
@@ -596,7 +575,7 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+const UPDATE_SUMMARIZATION_PROMPT = `The messages above are a conversation whose older history already contains a compaction summary (marked "The conversation history before this point was compacted into the following summary"), followed by newer messages.
 
 ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
 
@@ -714,6 +693,24 @@ function buildSummarizationContext(promptText: string): TranscriptContext {
 	});
 }
 
+/**
+ * Build a summarization request that reuses the session's live prompt prefix.
+ *
+ * The context prefix (system message with tool declarations, any previous
+ * compaction summary, and conversation messages) is exactly what the session
+ * sends, so serving-side prefix KV caches hit for the whole prefix. Only the
+ * appended summarization instruction is new input requiring a prefill.
+ */
+function buildPrefixSummarizationContext(contextPrefix: AgentMessage[], promptText: string): TranscriptContext {
+	const messages = convertToLlm(contextPrefix);
+	messages.push({
+		role: "user",
+		content: [{ type: "text", text: promptText }],
+		timestamp: Date.now(),
+	});
+	return normalizeContext({ messages });
+}
+
 /** Generate or update a conversation summary and return its provider usage. */
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
@@ -794,6 +791,8 @@ export async function generateSummaryWithUsage(
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
 	firstKeptEntryId: string;
+	/** Exact agent-state messages up to the cut point (system prompt, previous compaction summary replay, and all messages to summarize including any split turn prefix). Sent unchanged to the summarization request so serving-side prefix KV caches are reused. */
+	contextPrefix: AgentMessage[];
 	/** Messages that will be summarized and discarded */
 	messagesToSummarize: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
@@ -922,6 +921,15 @@ export function prepareCompaction(
 	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
 	if (!firstKeptEntry?.id) return undefined;
 	const firstKeptEntryId = firstKeptEntry.id;
+
+	// Exact agent-state message prefix up to the cut point. This is the same
+	// sequence the session sends, so the summarization request can reuse it
+	// verbatim for serving-side prefix KV cache hits.
+	let prefixEnd = 0;
+	for (let i = 0; i < cutPoint.firstKeptEntryIndex; i++) {
+		prefixEnd += projectedEntries[i].messages.length;
+	}
+	const contextPrefix = projection.messages.slice(0, prefixEnd);
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 
 	const messagesToSummarize = projectedEntries
@@ -947,6 +955,7 @@ export function prepareCompaction(
 
 	return {
 		firstKeptEntryId,
+		contextPrefix,
 		messagesToSummarize,
 		turnPrefixMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
@@ -961,28 +970,17 @@ export function prepareCompaction(
 // Main compaction function
 // ============================================================================
 
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
-
-Create a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.
-
-## Original Request
-[What did the user ask for?]
-
-## Progress So Far
-- [Key decisions and work completed in these messages]
-
-## Context Needed to Continue
-- [Information from these messages needed to understand the later work]
-
-Only summarize information explicitly present above. Do not infer or recreate later messages.`;
-
 /**
- * Generate summaries for compaction using prepared data.
+ * Generate the summary for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds uuid/parentUuid when saving.
+ *
+ * The summary request reuses the session's live prompt prefix (see
+ * {@link buildPrefixSummarizationContext}) so serving-side prefix KV caches
+ * are not re-prefilled for the summarized history.
  *
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
- * @param sessionId - Optional routing session ID forwarded without enabling prompt caching
+ * @param sessionId - Session ID forwarded for transport session affinity
  */
 export async function compact(
 	preparation: CompactionPreparation,
@@ -998,82 +996,37 @@ export async function compact(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<CompactionResult> {
-	const {
-		firstKeptEntryId,
-		messagesToSummarize,
-		turnPrefixMessages,
-		isSplitTurn,
-		tokensBefore,
-		previousSummary,
-		fileOps,
-		settings,
-	} = preparation;
+	const { contextPrefix, firstKeptEntryId, tokensBefore, previousSummary, fileOps, settings } = preparation;
 
-	// Generate summaries and merge into one
-	let summary: string;
-	let summaryUsage: Usage;
+	const maxTokens = Math.min(
+		Math.floor(0.8 * settings.reserveTokens),
+		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+	);
 
-	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		let historyText = previousSummary ?? "No prior history.";
-		let historyUsage: Usage | undefined;
-		if (messagesToSummarize.length > 0) {
-			const historyResult = await generateSummaryWithUsage(
-				messagesToSummarize,
-				model,
-				settings.reserveTokens,
-				apiKey,
-				headers,
-				signal,
-				customInstructions,
-				previousSummary,
-				thinkingLevel,
-				streamFn,
-				env,
-				retry,
-				callbacks,
-				sessionId,
-			);
-			historyText = historyResult.text;
-			historyUsage = historyResult.usage;
-		}
-		const turnPrefixResult = await generateTurnPrefixSummary(
-			turnPrefixMessages,
-			model,
-			settings.reserveTokens,
-			apiKey,
-			headers,
-			env,
-			signal,
-			thinkingLevel,
-			streamFn,
-			retry,
-			callbacks,
-			sessionId,
-		);
-		// Merge into single summary
-		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
-		summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
-	} else {
-		// Just generate history summary
-		const result = await generateSummaryWithUsage(
-			messagesToSummarize,
-			model,
-			settings.reserveTokens,
-			apiKey,
-			headers,
-			signal,
-			customInstructions,
-			previousSummary,
-			thinkingLevel,
-			streamFn,
-			env,
-			retry,
-			callbacks,
-			sessionId,
-		);
-		summary = result.text;
-		summaryUsage = result.usage;
+	let promptText = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		promptText = `${promptText}\n\nAdditional focus: ${customInstructions}`;
 	}
+
+	const response = await completeSummarization(
+		model,
+		buildPrefixSummarizationContext(contextPrefix, promptText),
+		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+		streamFn,
+		retry,
+		callbacks,
+	);
+
+	const failure = getSummarizationFailure(response, "Summarization");
+	if (failure) {
+		throw new Error(failure);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Summarization attempted to call a tool");
+	}
+
+	let summary = contentText(response.content);
+	const summaryUsage = response.usage;
 
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
@@ -1089,53 +1042,5 @@ export async function compact(
 		tokensBefore,
 		usage: summaryUsage,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
-	};
-}
-
-/**
- * Generate a summary for a turn prefix (when splitting a turn).
- */
-async function generateTurnPrefixSummary(
-	messages: AgentMessage[],
-	model: Model<any>,
-	reserveTokens: number,
-	apiKey: string | undefined,
-	headers?: Record<string, string>,
-	env?: Record<string, string>,
-	signal?: AbortSignal,
-	thinkingLevel?: ThinkingLevel,
-	streamFn?: StreamFn,
-	retry?: RetryPolicy,
-	callbacks?: RetryCallbacks,
-	sessionId?: string,
-): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `# Conversation\n${conversationText}\n\n# Instructions\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-
-	const response = await completeSummarization(
-		model,
-		buildSummarizationContext(promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
-		streamFn,
-		retry,
-		callbacks,
-	);
-
-	const failure = getSummarizationFailure(response, "Turn prefix summarization");
-	if (failure) {
-		throw new Error(failure);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Turn prefix summarization attempted to call a tool");
-	}
-
-	return {
-		text: contentText(response.content),
-		usage: response.usage,
 	};
 }
