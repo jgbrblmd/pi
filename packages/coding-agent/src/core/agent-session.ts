@@ -2690,7 +2690,7 @@ export class AgentSession {
 			request.env,
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
-			undefined, // sessionId
+			this.sessionManager.getSessionId(),
 		);
 	}
 

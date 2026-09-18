@@ -128,9 +128,10 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
-	it("preserves the previous summary without an empty history request for a split turn", async () => {
+	it("summarizes a split turn in a single request over the live context prefix", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			contextPrefix: [...messages],
 			messagesToSummarize: [],
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -143,12 +144,12 @@ describe("generateSummary reasoning options", () => {
 		const result = await compact(preparation, createModel(false), "test-key");
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
-		expect(result.summary).toContain("previous checkpoint");
+		expect(result.summary).toBe("## Goal\nTest summary");
 		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
 		const prompt = JSON.stringify(requestContext.messages);
-		// Regression test for #9652: clear boundaries and continuation wording avoid the reasoning-extraction false positive.
-		expect(prompt).toContain("# Conversation\\n[User]: Summarize this.");
-		expect(prompt).toContain("# Instructions\\nThe messages above are earlier context from an ongoing conversation.");
+		// The live prefix is sent as real messages and the update instruction is appended.
+		expect(prompt).toContain("Summarize this.");
+		expect(prompt).toContain("Update the existing structured summary");
 	});
 
 	it("rejects tool calls from conversation summaries", async () => {
@@ -163,6 +164,7 @@ describe("generateSummary reasoning options", () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			contextPrefix: [...messages],
 			messagesToSummarize: [],
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -172,7 +174,7 @@ describe("generateSummary reasoning options", () => {
 		};
 
 		await expect(compact(preparation, createModel(false), "test-key")).rejects.toThrow(
-			"Turn prefix summarization attempted to call a tool",
+			"Summarization attempted to call a tool",
 		);
 	});
 
@@ -196,6 +198,7 @@ describe("generateSummary reasoning options", () => {
 		});
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			contextPrefix: [...messages],
 			messagesToSummarize: [],
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -279,6 +282,7 @@ describe("generateSummary reasoning options", () => {
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
+			contextPrefix: [...messages],
 			messagesToSummarize: messages,
 			turnPrefixMessages: messages,
 			isSplitTurn: true,
@@ -289,13 +293,7 @@ describe("generateSummary reasoning options", () => {
 
 		const result = await compact(preparation, createModel(false, 128000), "test-key");
 
-		expect(result.usage).toEqual({
-			...mockSummaryResponse.usage,
-			input: 20,
-			output: 20,
-			totalTokens: 40,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		});
-		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
+		expect(result.usage).toEqual(mockSummaryResponse.usage);
+		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000]);
 	});
 });
