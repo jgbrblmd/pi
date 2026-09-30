@@ -9,10 +9,12 @@ import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-a
 import {
 	contentText,
 	getCurrentSystemMessage,
+	isContextOverflow,
 	normalizeContext,
 	type RetryCallbacks,
 	type RetryPolicy,
 	retryAssistantCall,
+	retryDelayMs,
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import type {
@@ -33,7 +35,6 @@ import {
 	type SessionProjection,
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
-import { combineUsage } from "../usage-totals.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -786,6 +787,76 @@ export async function generateSummaryWithUsage(
 }
 
 // ============================================================================
+// Summarization Recovery
+// ==========================================================================
+
+/** Roles that carry conversation state and must never be dropped from a summarization prefix. */
+function isDroppablePrefixMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "system":
+		case "branchSummary":
+		case "compactionSummary":
+			return false;
+		default:
+			return true;
+	}
+}
+
+/**
+ * Drop whole conversation turns from the head of a summarization prefix until the
+ * estimated size fits the model's context window. State messages (system prompt,
+ * compaction/branch summaries) are always kept. Returns undefined when no
+ * conversation content can be dropped.
+ */
+function shrinkPrefixToFit(
+	prefix: AgentMessage[],
+	model: Model<any>,
+	promptText: string,
+	maxTokens: number,
+): AgentMessage[] | undefined {
+	const budget = Math.max(0, model.contextWindow - maxTokens);
+	const promptTokens = Math.ceil(promptText.length / 4);
+	const tokensFrom = (from: number): number =>
+		prefix.slice(from).reduce((sum, message) => sum + estimateTokens(message), 0) + promptTokens;
+
+	let head = 0;
+	while (head < prefix.length && !isDroppablePrefixMessage(prefix[head])) head++;
+	if (head >= prefix.length) return undefined;
+
+	// Drop at least one complete turn, then keep dropping while the estimate
+	// still exceeds the budget. Cutting at turn starts keeps the transcript well-formed.
+	let keepFrom = head;
+	for (;;) {
+		let next = keepFrom + 1;
+		while (next < prefix.length && !isTurnStartMessage(prefix[next])) next++;
+		if (next <= keepFrom) break;
+		keepFrom = next;
+		if (tokensFrom(keepFrom) <= budget) break;
+	}
+	// Keep the leading state block (system prompt, summaries) intact.
+	return prefix.slice(0, head).concat(prefix.slice(keepFrom));
+}
+
+/** Abortable sleep for summarization retry backoff. */
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(new Error("Aborted"));
+			return;
+		}
+		const timeout = setTimeout(resolve, ms);
+		signal?.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timeout);
+				reject(new Error("Aborted"));
+			},
+			{ once: true },
+		);
+	});
+}
+
+// ============================================================================
 // Compaction Preparation (for extensions)
 // ============================================================================
 
@@ -1009,21 +1080,64 @@ export async function compact(
 		promptText = `${promptText}\n\nAdditional focus: ${customInstructions}`;
 	}
 
-	const response = await completeSummarization(
-		model,
-		buildPrefixSummarizationContext(contextPrefix, promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
-		streamFn,
-		retry,
-		callbacks,
-	);
+	// The provider-level retry policy does not cover two summarization failure
+	// modes, so recover from them here:
+	// - The model answers with a tool call instead of the summary. Re-issue the
+	//   request, bounded by the configured retry budget with the same backoff.
+	// - The prefix-based request exceeds the context window (explicit overflow
+	//   error, or a provider that silently truncates the input). Shrink the
+	//   prefix by dropping the oldest conversation turns and re-issue.
+	const maxToolCallRetries = retry?.enabled ? retry.maxRetries : 0;
+	let toolCallRetries = 0;
+	let prefix = contextPrefix;
+	let response: AssistantMessage;
+	for (;;) {
+		response = await completeSummarization(
+			model,
+			buildPrefixSummarizationContext(prefix, promptText),
+			createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+			streamFn,
+			retry,
+			callbacks,
+		);
 
-	const failure = getSummarizationFailure(response, "Summarization");
-	if (failure) {
-		throw new Error(failure);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Summarization attempted to call a tool");
+		const failure = getSummarizationFailure(response, "Summarization");
+		if (failure) {
+			if (!isContextOverflow(response, model.contextWindow)) throw new Error(failure);
+			const shrunk = shrinkPrefixToFit(prefix, model, promptText, maxTokens);
+			if (!shrunk) throw new Error(failure);
+			prefix = shrunk;
+			continue;
+		}
+
+		// Silent overflow: the provider truncated the input to fit the window, so
+		// the summary is missing the oldest context. Shrink and re-ask; if nothing
+		// can be dropped, accept the truncated-input summary as best effort.
+		if (isContextOverflow(response, model.contextWindow)) {
+			const shrunk = shrinkPrefixToFit(prefix, model, promptText, maxTokens);
+			if (!shrunk) break;
+			prefix = shrunk;
+			continue;
+		}
+
+		if (response.content.some((block) => block.type === "toolCall")) {
+			if (toolCallRetries >= maxToolCallRetries) {
+				throw new Error("Summarization attempted to call a tool");
+			}
+			toolCallRetries++;
+			const delayMs = retryDelayMs(retry!, toolCallRetries);
+			await callbacks?.onRetryScheduled?.(
+				toolCallRetries,
+				maxToolCallRetries,
+				delayMs,
+				"Summarization attempted to call a tool",
+			);
+			await sleepMs(delayMs, signal);
+			await callbacks?.onRetryAttemptStart?.();
+			continue;
+		}
+
+		break;
 	}
 
 	let summary = contentText(response.content);

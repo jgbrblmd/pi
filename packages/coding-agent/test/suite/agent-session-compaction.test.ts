@@ -334,7 +334,7 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.faux.state.callCount).toBe(1);
 	});
 
-	it("uses the standalone compaction request context", async () => {
+	it("reuses the live session prompt prefix for the compaction request", async () => {
 		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
@@ -346,7 +346,7 @@ describe("AgentSession compaction characterization", () => {
 
 		let requestContext: TranscriptContext | undefined;
 		let requestOptions: SimpleStreamOptions | undefined;
-		useSummaryStreamFn(harness, "standalone summary", (context, options) => {
+		useSummaryStreamFn(harness, "prefix summary", (context, options) => {
 			requestContext = context;
 			requestOptions = options;
 		});
@@ -354,10 +354,14 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.compact();
 
 		expect(transformContext).not.toHaveBeenCalled();
-		expect(getCurrentSystemPrompt(requestContext?.messages ?? [])).not.toBe(harness.session.agent.state.systemPrompt);
-		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual([]);
-		// Regression test for #9652: split-turn summaries use a clear Markdown conversation boundary.
-		expect(JSON.stringify(requestContext?.messages)).toContain("# Conversation\\n[User]: message to compact");
+		// The live prefix is sent verbatim: same system prompt as the session, no tools added.
+		const requestMessages = requestContext?.messages ?? [];
+		expect(getCurrentSystemPrompt(requestMessages)).toBe(harness.session.agent.state.systemPrompt);
+		expect(getCurrentTools(requestMessages)).toEqual([]);
+		// The conversation is sent as real messages and the summarization instruction is appended.
+		const serialized = JSON.stringify(requestMessages);
+		expect(serialized).toContain("message to compact");
+		expect(serialized).toContain("Create a structured context checkpoint summary");
 		expect(requestOptions).toMatchObject({ cacheRetention: "none" });
 		expect(requestOptions?.sessionId).not.toBe("active-routing-session");
 		expect(requestOptions?.transport).toBeUndefined();

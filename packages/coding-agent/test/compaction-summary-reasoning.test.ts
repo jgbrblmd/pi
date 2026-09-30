@@ -21,6 +21,26 @@ vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
 	};
 });
 
+function createAssistantTextMessage(text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+	};
+}
+
 function createModel(
 	reasoning: boolean,
 	maxTokens = 8192,
@@ -63,6 +83,13 @@ const mockToolCallResponse: AssistantMessage = {
 	...mockSummaryResponse,
 	content: [{ type: "toolCall", id: "tool-call-1", name: "read", arguments: { path: "README.md" } }],
 	stopReason: "toolUse",
+};
+
+const mockOverflowResponse: AssistantMessage = {
+	...mockSummaryResponse,
+	content: [],
+	stopReason: "error",
+	errorMessage: "prompt is too long: 213462 tokens > 200000 maximum",
 };
 
 const messages: AgentMessage[] = [{ role: "user", content: "Summarize this.", timestamp: Date.now() }];
@@ -188,6 +215,113 @@ describe("generateSummary reasoning options", () => {
 		await expect(generateSummaryWithUsage(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
 			"generation hit the token cap",
 		);
+	});
+
+	function createPreparation(contextPrefix: AgentMessage[]): CompactionPreparation {
+		return {
+			firstKeptEntryId: "entry-keep",
+			contextPrefix,
+			messagesToSummarize: [],
+			turnPrefixMessages: contextPrefix,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+	}
+
+	const fastRetry = { enabled: true, maxRetries: 2, baseDelayMs: 1, maxAgentDelayMs: 100 };
+
+	it("retries summarization when the model answers with a tool call", async () => {
+		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
+		completeSimpleMock.mockResolvedValue(mockSummaryResponse);
+
+		const result = await compact(
+			createPreparation([...messages]),
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			fastRetry,
+		);
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		expect(result.summary).toBe("## Goal\nTest summary");
+	});
+
+	it("fails after exhausting the tool call retry budget", async () => {
+		completeSimpleMock.mockResolvedValue(mockToolCallResponse);
+
+		await expect(
+			compact(
+				createPreparation([...messages]),
+				createModel(false),
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				fastRetry,
+			),
+		).rejects.toThrow("Summarization attempted to call a tool");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(3); // initial call + 2 retries
+	});
+
+	it("shrinks the context prefix and retries on context overflow", async () => {
+		completeSimpleMock.mockResolvedValueOnce(mockOverflowResponse);
+		completeSimpleMock.mockResolvedValue(mockSummaryResponse);
+		const preparation = createPreparation([
+			{ role: "system", content: "System prompt.", timestamp: Date.now() },
+			{ role: "user", content: "Old message.", timestamp: Date.now() },
+			createAssistantTextMessage("Old reply."),
+			...messages,
+		]);
+
+		const result = await compact(
+			preparation,
+			createModel(false),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			fastRetry,
+		);
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		expect(result.summary).toBe("## Goal\nTest summary");
+		const secondRequest = JSON.stringify((completeSimpleMock.mock.calls[1][1] as TranscriptContext).messages);
+		expect(secondRequest).toContain("Summarize this.");
+		expect(secondRequest).not.toContain("Old message.");
+	});
+
+	it("fails when context overflow cannot be resolved by shrinking", async () => {
+		completeSimpleMock.mockResolvedValue(mockOverflowResponse);
+
+		await expect(
+			compact(
+				createPreparation([...messages]),
+				createModel(false),
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				fastRetry,
+			),
+		).rejects.toThrow("Summarization failed: prompt is too long");
+		// First attempt overflows, the prefix shrinks to nothing, the second attempt overflows with nothing left to drop.
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("rejects a length-limited split-turn summary", async () => {
